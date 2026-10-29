@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { requireAuth } from "./auth.js";
+import { notifyAllActiveUsers, notifyRoles, notifyUsers } from "./notification-service.js";
 
 const SELLING_ROLES = ["MAIN_ADMIN", "CO_ADMIN", "STAFF"];
 const APPROVER_ROLES = ["MAIN_ADMIN", "CO_ADMIN"];
@@ -259,11 +260,46 @@ export function createSalesRouter(db, client) {
       });
 
       if (result?.kind === "approval") {
+        await notifyRoles(db, APPROVER_ROLES, {
+          type: "SALE_APPROVAL",
+          title: "Sale approval needed",
+          body: `${user.name} requested approval for ${normalizedId}, quantity ${body.quantity}.`,
+          product_id: normalizedId,
+          approval_request_id: result.requestId,
+          data: { approval_request_id: result.requestId }
+        });
         return res.status(202).json({
           status: "PENDING_APPROVAL",
           message: "The requested price requires approval.",
           approvalRequestId: result.requestId
         });
+      }
+
+      if (result?.kind === "sale") {
+        await notifyRoles(db, APPROVER_ROLES, {
+          type: "SALE_UPDATE",
+          title: "Sale recorded",
+          body: `${result.productId}: ${result.quantitySold} unit(s), total ₹${Number(result.totalAmount).toFixed(2)}.`,
+          product_id: result.productId,
+          data: { sale_id: result.saleId }
+        });
+        if (result.remainingQuantity === 0) {
+          await notifyAllActiveUsers(db, {
+            type: "OUT_OF_STOCK",
+            title: "Product out of stock",
+            body: `${result.productId} has reached zero available units.`,
+            product_id: result.productId,
+            dedupeKey: `OUT_OF_STOCK:${result.productId}`
+          });
+        } else if (result.remainingQuantity <= 3) {
+          await notifyAllActiveUsers(db, {
+            type: "LOW_STOCK",
+            title: "Low stock alert",
+            body: `${result.productId} has only ${result.remainingQuantity} unit(s) left.`,
+            product_id: result.productId,
+            dedupeKey: `LOW_STOCK:${result.productId}`
+          });
+        }
       }
 
       return res.status(201).json({
@@ -467,7 +503,13 @@ export function createSalesRouter(db, client) {
 
             decisionResult = {
               status: "APPROVED",
-              saleId
+              saleId,
+              requestId: request._id.toString(),
+              requestedBy: request.requested_by,
+              productId: request.product_id,
+              quantity: request.quantity,
+              totalAmount: sale.total_amount,
+              remainingQuantity: product.quantity - request.quantity
             };
           } else {
             const statusUpdate = await approvals.updateOne(
@@ -499,9 +541,55 @@ export function createSalesRouter(db, client) {
               { session }
             );
 
-            decisionResult = { status: "REJECTED" };
+            decisionResult = {
+              status: "REJECTED",
+              requestId: request._id.toString(),
+              requestedBy: request.requested_by,
+              productId: request.product_id,
+              quantity: request.quantity
+            };
           }
         });
+
+        if (decisionResult?.requestedBy) {
+          await notifyUsers(db, [decisionResult.requestedBy], {
+            type: "SALE_APPROVAL_RESULT",
+            title: decisionResult.status === "APPROVED" ? "Sale approved" : "Sale rejected",
+            body: decisionResult.status === "APPROVED"
+              ? `Your sale request for ${decisionResult.productId} was approved.`
+              : `Your sale request for ${decisionResult.productId} was rejected.`,
+            product_id: decisionResult.productId,
+            approval_request_id: decisionResult.requestId,
+            data: { approval_request_id: decisionResult.requestId }
+          });
+        }
+
+        if (decisionResult?.status === "APPROVED") {
+          await notifyRoles(db, APPROVER_ROLES, {
+            type: "SALE_UPDATE",
+            title: "Approved sale completed",
+            body: `${decisionResult.productId}: ${decisionResult.quantity} unit(s), total ₹${Number(decisionResult.totalAmount).toFixed(2)}.`,
+            product_id: decisionResult.productId,
+            data: { sale_id: decisionResult.saleId }
+          });
+          if (decisionResult.remainingQuantity === 0) {
+            await notifyAllActiveUsers(db, {
+              type: "OUT_OF_STOCK",
+              title: "Product out of stock",
+              body: `${decisionResult.productId} has reached zero available units.`,
+              product_id: decisionResult.productId,
+              dedupeKey: `OUT_OF_STOCK:${decisionResult.productId}`
+            });
+          } else if (decisionResult.remainingQuantity <= 3) {
+            await notifyAllActiveUsers(db, {
+              type: "LOW_STOCK",
+              title: "Low stock alert",
+              body: `${decisionResult.productId} has only ${decisionResult.remainingQuantity} unit(s) left.`,
+              product_id: decisionResult.productId,
+              dedupeKey: `LOW_STOCK:${decisionResult.productId}`
+            });
+          }
+        }
 
         return res.status(200).json({
           message: "Approval decision recorded.",

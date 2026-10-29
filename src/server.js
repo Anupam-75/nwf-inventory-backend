@@ -10,6 +10,7 @@ import { MongoClient } from "mongodb";
 import { createAuthRouter, requireAuth } from "./auth.js";
 import { createInventoryRouter } from "./inventory-routes.js";
 import { createUserRouter } from "./user-routes.js";
+import { createNotificationsRouter } from "./notification-routes.js";
 
 const app = express();
 
@@ -106,6 +107,11 @@ async function startServer() {
       }
     );
 
+    await db.collection("notifications").createIndex({ recipientLoginId: 1, createdAt: -1 });
+    await db.collection("notifications").createIndex({ recipientLoginId: 1, readAt: 1 });
+    await db.collection("notification_devices").createIndex({ token: 1 }, { unique: true });
+    await db.collection("notification_devices").createIndex({ loginId: 1, active: 1 });
+
     app.get("/health", (_req, res) => {
       res.status(200).json({
         status: "ok",
@@ -143,6 +149,7 @@ async function startServer() {
     app.use("/api/expenses", createExpenseRouter(db, client));
     app.use("/api/reports", createReportsRouter(db));
     app.use("/api/management", createManagementRouter(db));
+    app.use("/api/notifications", createNotificationsRouter(db));
     // Create products: Main Admin and Co-admin only.
     app.post(
       "/api/products",

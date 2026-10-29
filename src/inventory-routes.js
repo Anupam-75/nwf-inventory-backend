@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { requireAuth } from "./auth.js";
+import { notifyAllActiveUsers, resolveStockAlerts } from "./notification-service.js";
 
 function validText(value, maxLength = 100) {
   return (
@@ -185,6 +186,15 @@ export function createInventoryRouter(db, client) {
           },
           { session }
         );
+      });
+
+      await resolveStockAlerts(db, normalizedId);
+      await notifyAllActiveUsers(db, {
+        type: "STOCK_RESTOCKED",
+        title: "Inventory restocked",
+        body: `${normalizedId}: ${body.quantity_received} unit(s) received. Available now: ${availableQuantity}.`,
+        product_id: normalizedId,
+        data: { available_quantity: availableQuantity }
       });
 
       return res.status(200).json({
