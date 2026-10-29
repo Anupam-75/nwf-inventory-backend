@@ -208,6 +208,62 @@ export function createManagementRouter(db) {
     }
   );
 
+  // Delete is a soft delete: historical sales retain their product snapshots.
+  // Only Main Admin may remove a product from active catalogue and stock lists.
+  router.delete(
+    "/products/:productId",
+    requireAuth(db),
+    async (req, res) => {
+      if (!adminOnly(req, res)) return;
+
+      const productId = req.params.productId.trim();
+      if (!text(productId, 64)) {
+        return res.status(400).json({ error: "Invalid product ID." });
+      }
+
+      const filter = {
+        product_id: {
+          $regex: `^${escapeRegex(productId)}$`,
+          $options: "i"
+        },
+        active: { $ne: false }
+      };
+
+      try {
+        const result = await products.updateOne(filter, {
+          $set: { active: false, updatedAt: new Date() }
+        });
+
+        if (result.matchedCount !== 1) {
+          return res.status(404).json({
+            error: "Active product not found. It may already be deleted."
+          });
+        }
+
+        try {
+          await activities.insertOne({
+            actorName: req.authUser.name ?? req.authUser.loginId,
+            actorLoginId: req.authUser.loginId,
+            type: "PRODUCT_DELETED",
+            description: `Soft-deleted product ${productId}; historical sales were preserved.`,
+            timestamp: new Date()
+          });
+        } catch {
+          // The product update must not be reported as failed just because
+          // the optional audit record could not be written.
+        }
+
+        return res.status(200).json({
+          message: "Product removed from active inventory. Historical sales were preserved.",
+          product_id: productId,
+          deleted: true
+        });
+      } catch {
+        return res.status(500).json({ error: "Unable to delete product." });
+      }
+    }
+  );
+
   // Low-stock and out-of-stock alerts.
   router.get("/stock-alerts", requireAuth(db), async (req, res) => {
     const threshold = req.query.threshold === undefined

@@ -151,6 +151,79 @@ export function createReportsRouter(db) {
   const sales = db.collection("sales");
   const expenses = db.collection("stall_expenses");
 
+  // Revenue-only overview for Main Admin and Co-admin. This aggregates all
+  // matching sales in MongoDB instead of relying on the capped sales-history list.
+  router.get("/sales-overview", requireAuth(db), async (req, res) => {
+    if (!["MAIN_ADMIN", "CO_ADMIN"].includes(req.authUser.role)) {
+      return res.status(403).json({
+        error: "You cannot access the business overview."
+      });
+    }
+
+    const month = req.query.month;
+    if (!validMonth(month)) {
+      return res.status(400).json({
+        error: "A valid month is required in YYYY-MM format."
+      });
+    }
+
+    try {
+      const { start, end } = monthRange(month);
+      const [summary] = await sales.aggregate([
+        { $match: { transaction_time: { $gte: start, $lt: end } } },
+        {
+          $group: {
+            _id: null,
+            salesCount: { $sum: 1 },
+            unitsSold: { $sum: { $ifNull: ["$quantity", 0] } },
+            revenue: { $sum: { $ifNull: ["$total_amount", 0] } },
+            cashRevenue: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$payment_method", "CASH"] },
+                  { $ifNull: ["$total_amount", 0] },
+                  0
+                ]
+              }
+            },
+            upiRevenue: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$payment_method", "UPI"] },
+                  { $ifNull: ["$total_amount", 0] },
+                  0
+                ]
+              }
+            }
+          }
+        }
+      ]).toArray();
+
+      const result = summary ?? {
+        salesCount: 0,
+        unitsSold: 0,
+        revenue: 0,
+        cashRevenue: 0,
+        upiRevenue: 0
+      };
+      return res.status(200).json({
+        month,
+        timezone: "Asia/Kolkata",
+        summary: {
+          salesCount: result.salesCount,
+          unitsSold: result.unitsSold,
+          revenue: roundMoney(result.revenue),
+          cashRevenue: roundMoney(result.cashRevenue),
+          upiRevenue: roundMoney(result.upiRevenue)
+        }
+      });
+    } catch {
+      return res.status(500).json({
+        error: "Unable to load the business overview."
+      });
+    }
+  });
+
   router.get("/profit", requireAuth(db), async (req, res) => {
     if (!mainAdminOnly(req, res)) return;
 
