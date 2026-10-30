@@ -6,7 +6,7 @@ import { createSalesRouter } from "./sales-routes.js";
 import "dotenv/config";
 import express from "express";
 import helmet from "helmet";
-import { MongoClient } from "mongodb";
+import { MongoClient, GridFSBucket, ObjectId } from "mongodb";
 import { createAuthRouter, requireAuth } from "./auth.js";
 import { createInventoryRouter } from "./inventory-routes.js";
 import { createUserRouter } from "./user-routes.js";
@@ -96,6 +96,7 @@ async function startServer() {
 
     const db = client.db(databaseName);
     const products = db.collection("products");
+    const productPhotoBucket = new GridFSBucket(db, { bucketName: "product_photos" });
 
     await db.command({ ping: 1 });
 
@@ -148,7 +149,7 @@ async function startServer() {
     app.use("/api/sales", createSalesRouter(db, client));
     app.use("/api/expenses", createExpenseRouter(db, client));
     app.use("/api/reports", createReportsRouter(db));
-    app.use("/api/management", createManagementRouter(db));
+    app.use("/api/management", createManagementRouter(db, productPhotoBucket));
     app.use("/api/notifications", createNotificationsRouter(db));
     // Create products: Main Admin and Co-admin only.
     app.post(
@@ -237,6 +238,7 @@ requireAuth(db),
           supplier_name: body.supplier_name.trim(),
           sale_price: body.sale_price,
           photo: body.photo?.trim() || null,
+          photoFileId: null,
           category: body.category.trim(),
           subcategory: body.subcategory.trim(),
           stall_number: body.stall_number.trim(),
@@ -280,6 +282,140 @@ requireAuth(db),
         }
       }
     );
+
+    // Product photos are stored in MongoDB Atlas GridFS. This avoids requiring
+    // Firebase Storage billing on the Spark plan. Max upload is 8 MiB; Android
+    // downsizes and converts selected images to JPEG before sending them here.
+    app.put(
+      "/api/products/:productId/photo",
+      requireAuth(db),
+      express.raw({ type: ["image/jpeg", "image/png", "image/webp"], limit: "8mb" }),
+      async (req, res) => {
+        const user = req.authUser;
+        if (!["MAIN_ADMIN", "CO_ADMIN"].includes(user.role)) {
+          return res.status(403).json({ error: "Only administrators can upload product photos." });
+        }
+
+        const productId = req.params.productId.trim();
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(productId)) {
+          return res.status(400).json({ error: "Invalid product ID." });
+        }
+
+        const contentType = String(req.get("content-type") || "")
+          .split(";")[0].trim().toLowerCase();
+        const extensionByType = {
+          "image/jpeg": "jpg",
+          "image/png": "png",
+          "image/webp": "webp"
+        };
+        const extension = extensionByType[contentType];
+        if (!extension) {
+          return res.status(415).json({ error: "Upload a JPEG, PNG, or WebP image." });
+        }
+        if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+          return res.status(400).json({ error: "The uploaded image is empty or invalid." });
+        }
+
+        try {
+          const product = await products.findOne({
+            product_id: makeExactFilter(productId),
+            active: { $ne: false }
+          }, { projection: { _id: 1, product_id: 1, photoFileId: 1 } });
+
+          if (!product) {
+            return res.status(404).json({ error: "Active product not found. Save the product before uploading its photo." });
+          }
+
+          const upload = productPhotoBucket.openUploadStream(
+            `${product.product_id}-${Date.now()}.${extension}`,
+            {
+              contentType,
+              metadata: {
+                product_id: product.product_id,
+                uploadedBy: user.loginId,
+                originalContentType: contentType
+              }
+            }
+          );
+
+          await new Promise((resolve, reject) => {
+            upload.once("error", reject);
+            upload.once("finish", resolve);
+            upload.end(req.body);
+          });
+
+          const fileId = upload.id;
+          const origin = `${process.env.NODE_ENV === "production" ? "https" : req.protocol}://${req.get("host")}`;
+          const photoUrl = `${origin}/api/catalog/products/${encodeURIComponent(product.product_id)}/photo?v=${fileId.toString()}`;
+          const update = await products.updateOne(
+            { _id: product._id },
+            { $set: {
+              photo: photoUrl,
+              photoFileId: fileId.toString(),
+              photoContentType: contentType,
+              updatedAt: new Date()
+            } }
+          );
+
+          if (update.modifiedCount !== 1 && update.matchedCount !== 1) {
+            await productPhotoBucket.delete(fileId).catch(() => {});
+            return res.status(409).json({ error: "Product changed during photo upload. Please retry." });
+          }
+
+          if (product.photoFileId && ObjectId.isValid(String(product.photoFileId))) {
+            await productPhotoBucket.delete(new ObjectId(String(product.photoFileId))).catch(() => {});
+          }
+
+          return res.status(200).json({
+            message: "Product photo uploaded successfully.",
+            product_id: product.product_id,
+            photo: photoUrl
+          });
+        } catch (error) {
+          if (error?.type === "entity.too.large") {
+            return res.status(413).json({ error: "Photo is too large. Choose a smaller image." });
+          }
+          console.error("Product photo upload failed:", error?.name ?? "Error");
+          return res.status(500).json({ error: "Unable to upload product photo." });
+        }
+      }
+    );
+
+    // Public catalogue photos are readable because the catalogue itself is public.
+    // Product deletion removes the GridFS file as well as the product document.
+    app.get("/api/catalog/products/:productId/photo", async (req, res) => {
+      const productId = req.params.productId.trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(productId)) {
+        return res.status(400).json({ error: "Invalid product ID." });
+      }
+
+      try {
+        const product = await products.findOne({
+          product_id: makeExactFilter(productId),
+          active: { $ne: false }
+        }, { projection: { photoFileId: 1, photoContentType: 1 } });
+
+        if (!product?.photoFileId || !ObjectId.isValid(String(product.photoFileId))) {
+          return res.status(404).json({ error: "Product photo not found." });
+        }
+
+        const fileId = new ObjectId(String(product.photoFileId));
+        const file = await productPhotoBucket.find({ _id: fileId }).limit(1).next();
+        if (!file) return res.status(404).json({ error: "Product photo not found." });
+
+        res.set("Content-Type", product.photoContentType || file.contentType || "image/jpeg");
+        res.set("Cache-Control", "public, max-age=86400");
+        res.set("X-Content-Type-Options", "nosniff");
+        const download = productPhotoBucket.openDownloadStream(fileId);
+        download.on("error", () => {
+          if (!res.headersSent) res.status(404).json({ error: "Product photo not found." });
+          else res.destroy();
+        });
+        return download.pipe(res);
+      } catch {
+        return res.status(500).json({ error: "Unable to load product photo." });
+      }
+    });
 
     // Public catalogue: cost and profit fields are excluded.
     app.get("/api/catalog/products", async (req, res) => {
@@ -402,6 +538,12 @@ requireAuth(db),
 
       if (error instanceof SyntaxError && Object.hasOwn(error, "body")) {
         return res.status(400).json({ error: "Invalid JSON request body." });
+      }
+      if (error?.type === "entity.too.large") {
+        return res.status(413).json({ error: "Uploaded photo is too large. Choose a smaller image." });
+      }
+      if (error?.type === "entity.unsupported") {
+        return res.status(415).json({ error: "Upload a JPEG, PNG, or WebP image." });
       }
 
       console.error("Unhandled request error:", error?.name || "Error");

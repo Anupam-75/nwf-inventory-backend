@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { ObjectId } from "mongodb";
 import { requireAuth } from "./auth.js";
 
 function escapeRegex(value) {
@@ -45,7 +46,7 @@ function monthRange(month) {
   };
 }
 
-export function createManagementRouter(db) {
+export function createManagementRouter(db, productPhotoBucket = null) {
   const router = Router();
   const products = db.collection("products");
   const sales = db.collection("sales");
@@ -208,8 +209,9 @@ export function createManagementRouter(db) {
     }
   );
 
-  // Delete is a soft delete: historical sales retain their product snapshots.
-  // Only Main Admin may remove a product from active catalogue and stock lists.
+  // Permanently delete the product master record, but never cascade into sales,
+  // purchase, receipt, approval, or activity history. The Main Admin must type
+  // the exact product ID into the confirmation dialog in the Android app.
   router.delete(
     "/products/:productId",
     requireAuth(db),
@@ -221,45 +223,69 @@ export function createManagementRouter(db) {
         return res.status(400).json({ error: "Invalid product ID." });
       }
 
+      const confirmation = req.body?.confirmProductId;
+      if (
+        typeof confirmation !== "string" ||
+        confirmation.trim().toUpperCase() !== productId.toUpperCase()
+      ) {
+        return res.status(400).json({
+          error: "Type the exact product ID to permanently delete this product."
+        });
+      }
+
       const filter = {
         product_id: {
           $regex: `^${escapeRegex(productId)}$`,
           $options: "i"
-        },
-        active: { $ne: false }
+        }
       };
 
       try {
-        const result = await products.updateOne(filter, {
-          $set: { active: false, updatedAt: new Date() }
+        const product = await products.findOne(filter, {
+          projection: { _id: 1, product_id: 1, photoFileId: 1 }
         });
 
-        if (result.matchedCount !== 1) {
-          return res.status(404).json({
-            error: "Active product not found. It may already be deleted."
-          });
+        if (!product) {
+          return res.status(404).json({ error: "Product not found." });
+        }
+
+        const result = await products.deleteOne({ _id: product._id });
+        if (result.deletedCount !== 1) {
+          return res.status(409).json({ error: "Product could not be deleted. Refresh and try again." });
+        }
+
+        let photoRemoved = true;
+        if (productPhotoBucket && product.photoFileId && ObjectId.isValid(String(product.photoFileId))) {
+          try {
+            await productPhotoBucket.delete(new ObjectId(String(product.photoFileId)));
+          } catch (error) {
+            photoRemoved = false;
+            console.error("Deleted product photo cleanup failed:", error?.name ?? "Error");
+          }
         }
 
         try {
           await activities.insertOne({
             actorName: req.authUser.name ?? req.authUser.loginId,
             actorLoginId: req.authUser.loginId,
-            type: "PRODUCT_DELETED",
-            description: `Soft-deleted product ${productId}; historical sales were preserved.`,
+            type: "PRODUCT_PERMANENTLY_DELETED",
+            description: `Permanently deleted product ${product.product_id}; sales and purchase history were preserved.`,
             timestamp: new Date()
           });
         } catch {
-          // The product update must not be reported as failed just because
-          // the optional audit record could not be written.
+          // The permanent deletion is complete; an audit-write failure must not
+          // misreport it as a failed delete.
         }
 
         return res.status(200).json({
-          message: "Product removed from active inventory. Historical sales were preserved.",
-          product_id: productId,
-          deleted: true
+          message: "Product permanently deleted. Historical sales and purchase records were preserved.",
+          product_id: product.product_id,
+          deleted: true,
+          permanent: true,
+          photoRemoved
         });
       } catch {
-        return res.status(500).json({ error: "Unable to delete product." });
+        return res.status(500).json({ error: "Unable to permanently delete product." });
       }
     }
   );
