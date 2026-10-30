@@ -109,13 +109,17 @@ export function createManagementRouter(db, productPhotoBucket = null) {
     }
   });
 
-  // Only Main Admin can edit product details and prices.
+  // Main Admin and Co-Admin can edit product details; only Main Admin can edit cost price.
   // Quantity is intentionally managed by receipts and sales.
   router.patch(
     "/products/:productId",
     requireAuth(db),
     async (req, res) => {
-      if (!adminOnly(req, res)) return;
+      if (!["MAIN_ADMIN", "CO_ADMIN"].includes(req.authUser.role)) {
+        return res.status(403).json({
+          error: "Only administrators can edit product details."
+        });
+      }
 
       const productId = req.params.productId.trim();
       if (!text(productId, 64)) {
@@ -123,6 +127,14 @@ export function createManagementRouter(db, productPhotoBucket = null) {
       }
 
       const body = req.body ?? {};
+      if (
+        req.authUser.role !== "MAIN_ADMIN" &&
+        Object.hasOwn(body, "cost_price")
+      ) {
+        return res.status(403).json({
+          error: "Only the Main Admin can edit cost price."
+        });
+      }
       const update = {};
       const allowedText = [
         "supplier_name",
