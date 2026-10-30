@@ -224,6 +224,160 @@ export function createReportsRouter(db) {
     }
   });
 
+  // Combined daily/monthly sales totals, split by stall. Main Admin and
+  // Co-admin see the whole shop; Staff only see sales recorded under their ID.
+  router.get("/sales-breakdown", requireAuth(db), async (req, res) => {
+    const date = req.query.date;
+    const month = req.query.month;
+    const hasDate = typeof date === "string";
+    const hasMonth = typeof month === "string";
+
+    if (hasDate === hasMonth) {
+      return res.status(400).json({
+        error: "Provide exactly one of date (YYYY-MM-DD) or month (YYYY-MM)."
+      });
+    }
+
+    let start;
+    let end;
+    let period;
+    let periodValue;
+
+    if (hasDate) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return res.status(400).json({ error: "A valid date is required in YYYY-MM-DD format." });
+      }
+      const [year, monthNumber, day] = date.split("-").map(Number);
+      const check = new Date(Date.UTC(year, monthNumber - 1, day));
+      if (
+        year < 2000 || year > 2098 ||
+        check.getUTCFullYear() !== year ||
+        check.getUTCMonth() !== monthNumber - 1 ||
+        check.getUTCDate() !== day
+      ) {
+        return res.status(400).json({ error: "The supplied date is not valid." });
+      }
+      start = new Date(Date.UTC(year, monthNumber - 1, day) - IST_OFFSET_MS);
+      end = new Date(Date.UTC(year, monthNumber - 1, day + 1) - IST_OFFSET_MS);
+      period = "daily";
+      periodValue = date;
+    } else {
+      if (!validMonth(month)) {
+        return res.status(400).json({ error: "A valid month is required in YYYY-MM format." });
+      }
+      ({ start, end } = monthRange(month));
+      period = "monthly";
+      periodValue = month;
+    }
+
+    try {
+      const match = { transaction_time: { $gte: start, $lt: end } };
+      if (req.authUser.role === "STAFF") {
+        match.sold_by = req.authUser.loginId;
+      }
+
+      const [stallRows, trendRows] = await Promise.all([
+        sales.aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: { $ifNull: ["$stall_number", "UNASSIGNED"] },
+              stallNumber: { $first: "$stall_number" },
+              salesCount: { $sum: 1 },
+              unitsSold: { $sum: { $ifNull: ["$quantity", 0] } },
+              revenue: { $sum: { $ifNull: ["$total_amount", 0] } },
+              cashRevenue: {
+                $sum: {
+                  $cond: [
+                    { $eq: ["$payment_method", "CASH"] },
+                    { $ifNull: ["$total_amount", 0] },
+                    0
+                  ]
+                }
+              },
+              upiRevenue: {
+                $sum: {
+                  $cond: [
+                    { $eq: ["$payment_method", "UPI"] },
+                    { $ifNull: ["$total_amount", 0] },
+                    0
+                  ]
+                }
+              }
+            }
+          },
+          { $sort: { _id: 1 } }
+        ]).toArray(),
+        period === "monthly"
+          ? sales.aggregate([
+              { $match: match },
+              {
+                $group: {
+                  _id: {
+                    $dateToString: {
+                      format: "%Y-%m-%d",
+                      date: "$transaction_time",
+                      timezone: "Asia/Kolkata"
+                    }
+                  },
+                  salesCount: { $sum: 1 },
+                  revenue: { $sum: { $ifNull: ["$total_amount", 0] } }
+                }
+              },
+              { $sort: { _id: 1 } }
+            ]).toArray()
+          : Promise.resolve([])
+      ]);
+
+      const summary = stallRows.reduce((total, row) => {
+        total.salesCount += row.salesCount || 0;
+        total.unitsSold += row.unitsSold || 0;
+        total.revenue += row.revenue || 0;
+        total.cashRevenue += row.cashRevenue || 0;
+        total.upiRevenue += row.upiRevenue || 0;
+        return total;
+      }, {
+        salesCount: 0,
+        unitsSold: 0,
+        revenue: 0,
+        cashRevenue: 0,
+        upiRevenue: 0
+      });
+
+      for (const key of ["revenue", "cashRevenue", "upiRevenue"]) {
+        summary[key] = roundMoney(summary[key]);
+      }
+
+      const byStall = stallRows.map(row => ({
+        stallNumber: row.stallNumber || "Unassigned",
+        salesCount: row.salesCount || 0,
+        unitsSold: row.unitsSold || 0,
+        revenue: roundMoney(row.revenue || 0),
+        cashRevenue: roundMoney(row.cashRevenue || 0),
+        upiRevenue: roundMoney(row.upiRevenue || 0)
+      }));
+
+      const dailyTrend = trendRows.map(row => ({
+        date: row._id,
+        salesCount: row.salesCount || 0,
+        revenue: roundMoney(row.revenue || 0)
+      }));
+
+      return res.status(200).json({
+        period,
+        value: periodValue,
+        timezone: "Asia/Kolkata",
+        scope: req.authUser.role === "STAFF" ? "SELF" : "SHOP",
+        summary,
+        byStall,
+        dailyTrend
+      });
+    } catch (error) {
+      console.error("Sales breakdown failed:", error.name);
+      return res.status(500).json({ error: "Unable to load the sales breakdown." });
+    }
+  });
+
   router.get("/profit", requireAuth(db), async (req, res) => {
     if (!mainAdminOnly(req, res)) return;
 
