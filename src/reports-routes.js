@@ -39,10 +39,10 @@ function monthRange(month) {
   return { start, end };
 }
 
-function mainAdminOnly(req, res) {
-  if (req.authUser.role !== "MAIN_ADMIN") {
+function adminOrCoAdminOnly(req, res) {
+  if (!["MAIN_ADMIN", "CO_ADMIN"].includes(req.authUser.role)) {
     res.status(403).json({
-      error: "Only the Main Admin can access profit reports."
+      error: "Profit and shop sales reports are available only to Main Admin and Co-admin."
     });
     return false;
   }
@@ -224,9 +224,13 @@ export function createReportsRouter(db) {
     }
   });
 
-  // Combined daily/monthly sales totals, split by stall. Main Admin and
-  // Co-admin see the whole shop; Staff only see sales recorded under their ID.
+  // Aggregated daily/monthly sales totals are restricted to Main Admin and Co-admin.
   router.get("/sales-breakdown", requireAuth(db), async (req, res) => {
+    if (!["MAIN_ADMIN", "CO_ADMIN"].includes(req.authUser.role)) {
+      return res.status(403).json({
+        error: "Sales summaries are restricted to Main Admin and Co-admin. Staff can view only their own transaction history."
+      });
+    }
     const date = req.query.date;
     const month = req.query.month;
     const hasDate = typeof date === "string";
@@ -272,10 +276,6 @@ export function createReportsRouter(db) {
 
     try {
       const match = { transaction_time: { $gte: start, $lt: end } };
-      if (req.authUser.role === "STAFF") {
-        match.sold_by = req.authUser.loginId;
-      }
-
       const [stallRows, trendRows] = await Promise.all([
         sales.aggregate([
           { $match: match },
@@ -367,7 +367,7 @@ export function createReportsRouter(db) {
         period,
         value: periodValue,
         timezone: "Asia/Kolkata",
-        scope: req.authUser.role === "STAFF" ? "SELF" : "SHOP",
+        scope: "SHOP",
         summary,
         byStall,
         dailyTrend
@@ -379,7 +379,7 @@ export function createReportsRouter(db) {
   });
 
   router.get("/profit", requireAuth(db), async (req, res) => {
-    if (!mainAdminOnly(req, res)) return;
+    if (!adminOrCoAdminOnly(req, res)) return;
 
     const month = req.query.month;
     const stallNumber = req.query.stall_number;

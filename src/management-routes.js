@@ -370,7 +370,7 @@ export function createManagementRouter(db, productPhotoBucket = null) {
   });
 
   // Sales history. Staff can see only their own sales.
-  // Cost and profit fields are exposed only to Main Admin.
+  // Cost and profit fields are exposed only to Main Admin and Co-admin.
   router.get("/sales-history", requireAuth(db), async (req, res) => {
     const range = monthRange(req.query.month);
 
@@ -414,7 +414,7 @@ export function createManagementRouter(db, productPhotoBucket = null) {
       approved_by: 1
     };
 
-    if (req.authUser.role === "MAIN_ADMIN") {
+    if (["MAIN_ADMIN", "CO_ADMIN"].includes(req.authUser.role)) {
       projection.cost_price_at_sale = 1;
       projection.total_cost = 1;
       projection.gross_profit = 1;

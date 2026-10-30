@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "check": "node --check src/server.js && node --check src/auth.js && node --check src/user-routes.js && node --check src/inventory-routes.js && node --check src/operations-routes.js && node --check src/sales-routes.js && node --check src/expense-routes.js && node --check src/reports-routes.js && node --check src/management-routes.js",
+    "check": "node --check src/server.js && node --check src/auth.js && node --check src/user-routes.js && node --check src/inventory-routes.js && node --check src/operations-routes.js && node --check src/sales-routes.js && node --check src/expense-routes.js && node --check src/reports-routes.js && node --check src/management-routes.js && node --check src/app-update-routes.js",
     "test": "npm run check"
   },
   "keywords": [],

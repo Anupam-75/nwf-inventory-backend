@@ -5,6 +5,7 @@ import { createOperationsRouter } from "./operations-routes.js";
 import { createSalesRouter } from "./sales-routes.js";
 import "dotenv/config";
 import express from "express";
+import { createAppUpdateRouter } from "./app-update-routes.js";
 import helmet from "helmet";
 import { MongoClient, GridFSBucket, ObjectId } from "mongodb";
 import { createAuthRouter, requireAuth } from "./auth.js";
@@ -17,6 +18,7 @@ const app = express();
 app.disable("x-powered-by");
 app.use(helmet());
 app.use(express.json({ limit: "100kb" }));
+app.use("/api/app-updates", createAppUpdateRouter());
 
 const port = Number(process.env.PORT || 3000);
 const host =
