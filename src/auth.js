@@ -6,6 +6,9 @@ import { ObjectId } from "mongodb";
 
 const TOKEN_ISSUER = "nwf-inventory-api";
 const TOKEN_AUDIENCE = "nwf-inventory-app";
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const MAX_FAILED_ATTEMPTS = 5;
+const ACCOUNT_LOCK_MS = 15 * 60 * 1000;
 
 export function requireAuth(db) {
   const users = db.collection("users");
@@ -18,17 +21,11 @@ export function requireAuth(db) {
   return async (req, res, next) => {
     const header = req.headers.authorization;
 
-    if (
-      typeof header !== "string" ||
-      !header.startsWith("Bearer ")
-    ) {
-      return res.status(401).json({
-        error: "Authentication required."
-      });
+    if (typeof header !== "string" || !header.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Authentication required." });
     }
 
     let payload;
-
     try {
       payload = jwt.verify(header.slice(7), secret, {
         issuer: TOKEN_ISSUER,
@@ -36,9 +33,7 @@ export function requireAuth(db) {
         algorithms: ["HS256"]
       });
     } catch {
-      return res.status(401).json({
-        error: "Invalid or expired token."
-      });
+      return res.status(401).json({ error: "Invalid or expired token." });
     }
 
     if (
@@ -47,20 +42,13 @@ export function requireAuth(db) {
       typeof payload.sub !== "string" ||
       !ObjectId.isValid(payload.sub)
     ) {
-      return res.status(401).json({
-        error: "Invalid token."
-      });
+      return res.status(401).json({ error: "Invalid token." });
     }
 
     try {
       const user = await users.findOne(
-        {
-          _id: new ObjectId(payload.sub),
-          isActive: true
-        },
-        {
-          projection: { passwordHash: 0 }
-        }
+        { _id: new ObjectId(payload.sub), isActive: true },
+        { projection: { passwordHash: 0 } }
       );
 
       if (!user) {
@@ -69,9 +57,23 @@ export function requireAuth(db) {
         });
       }
 
-      // Read current role from MongoDB, not from the token.
+      // Old tokens without authVersion remain valid until their original expiry.
+      // Resetting a password/PIN increments the DB value and revokes old sessions.
+      const tokenVersion = Number.isSafeInteger(payload.authVersion)
+        ? payload.authVersion
+        : 0;
+      const currentVersion = Number.isSafeInteger(user.authVersion)
+        ? user.authVersion
+        : 0;
+
+      if (tokenVersion !== currentVersion) {
+        return res.status(401).json({
+          error: "Your session was changed. Please sign in again."
+        });
+      }
+
       req.authUser = user;
-      next();
+      return next();
     } catch {
       return res.status(503).json({
         error: "Authentication service is temporarily unavailable."
@@ -117,28 +119,73 @@ export function createAuthRouter(db) {
 
     try {
       const normalizedId = loginId.trim().toUpperCase();
-
       const user = await users.findOne({
         loginId: normalizedId,
         isActive: true
       });
 
-      const passwordMatches = user
-        ? await bcrypt.compare(password, user.passwordHash)
-        : false;
+      if (!user) {
+        // Keep the response uniform for unknown IDs and wrong passwords.
+        await bcrypt.compare(password, "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy");
+        return res.status(401).json({ error: "Invalid login ID or password." });
+      }
 
-      if (!passwordMatches) {
-        return res.status(401).json({
-          error: "Invalid login ID or password."
+      const now = Date.now();
+      const lockedUntil = user.lockedUntil ? new Date(user.lockedUntil).getTime() : 0;
+      if (Number.isFinite(lockedUntil) && lockedUntil > now) {
+        return res.status(429).json({
+          error: "This account is temporarily locked after too many incorrect PIN/password attempts. Try again in 15 minutes."
         });
       }
 
+      let failedAttempts = Number.isSafeInteger(user.failedLoginAttempts)
+        ? user.failedLoginAttempts
+        : 0;
+      if (user.lockedUntil && lockedUntil <= now) {
+        failedAttempts = 0;
+        await users.updateOne(
+          { _id: user._id },
+          { $set: { failedLoginAttempts: 0 }, $unset: { lockedUntil: "" } }
+        );
+      }
+
+      const passwordMatches = await bcrypt.compare(password, user.passwordHash);
+      if (!passwordMatches) {
+        const nextFailures = failedAttempts + 1;
+        if (nextFailures >= MAX_FAILED_ATTEMPTS) {
+          await users.updateOne(
+            { _id: user._id, isActive: true },
+            {
+              $set: {
+                failedLoginAttempts: nextFailures,
+                lockedUntil: new Date(now + ACCOUNT_LOCK_MS)
+              }
+            }
+          );
+          return res.status(429).json({
+            error: "This account is temporarily locked after five incorrect attempts. Try again in 15 minutes."
+          });
+        }
+
+        await users.updateOne(
+          { _id: user._id, isActive: true },
+          { $set: { failedLoginAttempts: nextFailures } }
+        );
+        return res.status(401).json({ error: "Invalid login ID or password." });
+      }
+
+      await users.updateOne(
+        { _id: user._id },
+        { $set: { failedLoginAttempts: 0 }, $unset: { lockedUntil: "" } }
+      );
+
+      const authVersion = Number.isSafeInteger(user.authVersion) ? user.authVersion : 0;
       const token = jwt.sign(
-        {},
+        { authVersion },
         secret,
         {
           subject: user._id.toString(),
-          expiresIn: "30m",
+          expiresIn: SESSION_TTL_SECONDS,
           issuer: TOKEN_ISSUER,
           audience: TOKEN_AUDIENCE,
           algorithm: "HS256"
@@ -148,7 +195,7 @@ export function createAuthRouter(db) {
       return res.status(200).json({
         token,
         tokenType: "Bearer",
-        expiresInSeconds: 1800,
+        expiresInSeconds: SESSION_TTL_SECONDS,
         user: {
           loginId: user.loginId,
           name: user.name,
